@@ -42,7 +42,7 @@ Next.js Dashboard (Inbox / Contacts / Analytics)
 | Database | PostgreSQL + SQLAlchemy async |
 | Messaging | Twilio SMS + WhatsApp |
 | AI | OpenAI Chat Completions |
-| Deploy | Railway / Docker |
+| Deploy | Railway / Docker (API + UI in one service) |
 
 ## Quick start
 
