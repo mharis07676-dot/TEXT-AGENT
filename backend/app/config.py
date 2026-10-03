@@ -97,7 +97,12 @@ def _is_placeholder(value: str) -> bool:
 
 
 def validate_required_settings(settings: Settings) -> None:
-    """Fail fast on missing production env vars. Never log secret values."""
+    """Fail fast on missing production bootstrap vars. Never log secret values.
+
+    Twilio / OpenAI are optional at boot so Railway can deploy a healthy API
+    before messaging credentials are configured. Feature health is exposed via
+    /health and /api/v1/messaging/health instead.
+    """
     missing: list[str] = []
 
     if settings.is_production:
@@ -105,17 +110,10 @@ def validate_required_settings(settings: Settings) -> None:
             ("DATABASE_URL", settings.database_url),
             ("JWT_SECRET", settings.jwt_secret),
             ("SECRET_KEY", settings.secret_key),
-            ("TWILIO_ACCOUNT_SID", settings.twilio_account_sid),
-            ("TWILIO_AUTH_TOKEN", settings.twilio_auth_token),
-            ("OPENAI_API_KEY", settings.openai_api_key),
-            ("TWILIO_WEBHOOK_BASE_URL", settings.twilio_webhook_base_url),
         ]
         for name, value in checks:
             if _is_placeholder(value):
                 missing.append(name)
-
-        if not settings.twilio_sms_from_number and not settings.twilio_whatsapp_from:
-            missing.extend(["TWILIO_SMS_FROM_NUMBER", "TWILIO_WHATSAPP_FROM"])
 
     ordered_missing = list(dict.fromkeys(missing))
     if ordered_missing:
