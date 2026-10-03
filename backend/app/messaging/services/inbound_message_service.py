@@ -106,6 +106,10 @@ class InboundMessageService:
             return {"ok": True, "duplicate": True}
 
         await self._conversations.touch_last_message_at(conversation)
+        meta = dict(conversation.metadata_json or {})
+        meta["unread_count"] = int(meta.get("unread_count") or 0) + 1
+        conversation.metadata_json = meta
+        await self._db.flush()
         logger.info(
             "MESSAGE_SAVED direction=inbound conversation_id=%s message_sid=%s",
             conversation.id,

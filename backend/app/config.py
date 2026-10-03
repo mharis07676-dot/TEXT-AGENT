@@ -50,6 +50,9 @@ class Settings(BaseSettings):
     twilio_webhook_base_url: str = ""
 
     default_tenant_slug: str = "synas"
+    bootstrap_admin_email: str = "admin@synas.local"
+    bootstrap_admin_password: str = "changeme123"
+    bootstrap_admin_name: str = "Synas Admin"
     cors_origins: str = "http://localhost:3000"
     max_inbound_message_chars: int = 4000
 
