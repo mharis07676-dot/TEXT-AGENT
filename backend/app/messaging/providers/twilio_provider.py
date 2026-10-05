@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any, Mapping, Never
 
@@ -138,7 +139,8 @@ class TwilioMessagingProvider(MessagingProvider):
             create_kwargs["status_callback"] = status_callback_url
 
         try:
-            message = self._client.messages.create(**create_kwargs)
+            # Twilio REST client is synchronous — keep the event loop free.
+            message = await asyncio.to_thread(self._client.messages.create, **create_kwargs)
         except Exception as exc:  # noqa: BLE001 — surface provider failures cleanly
             logger.exception(
                 "OUTBOUND_MESSAGE_FAILED provider=twilio channel=%s",

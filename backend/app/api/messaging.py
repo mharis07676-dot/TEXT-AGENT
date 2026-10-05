@@ -1,24 +1,28 @@
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
 from datetime import datetime
 from typing import Annotated, Any, Literal
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Form, Header, HTTPException, Query, Request, Response
+from fastapi import APIRouter, BackgroundTasks, Depends, Form, Header, HTTPException, Query, Request, Response
+from fastapi.responses import StreamingResponse
 from sqlalchemy import Select, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.auth import AuthContext, get_current_auth
 from app.config import get_settings
-from app.db.session import get_db
+from app.db.session import get_db, get_session_factory
 from app.messaging.dispatcher import get_messaging_provider
 from app.messaging.enums import ConversationStatus, MessageDirection, MessageRole, MessagingChannel
 from app.messaging.providers.twilio_provider import TwilioSendError
 from app.messaging.schemas import MessagingHealthOut
 from app.messaging.services.inbound_message_service import InboundMessageService
 from app.messaging.services.outbound_message_service import OutboundMessageService
+from app.messaging.stream_hub import stream_hub
 from app.models import Contact, Conversation, Message, Tenant
 from app.schemas import (
     AiModeUpdate,
@@ -422,13 +426,72 @@ async def contact_conversations(
     return [await _conversation_out(db, row) for row in rows]
 
 
+@router.get("/conversations/{conversation_id}/stream")
+async def stream_conversation_events(
+    conversation_id: UUID,
+    request: Request,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    token: Annotated[str | None, Query()] = None,
+    authorization: Annotated[str | None, Header()] = None,
+) -> StreamingResponse:
+    """SSE stream for dashboard: inbound notices + AI typing deltas.
+
+    EventSource cannot set Authorization headers reliably, so `?token=` is supported.
+    """
+    from app.auth import auth_from_token
+
+    bearer = None
+    if authorization and authorization.lower().startswith("bearer "):
+        bearer = authorization.split(" ", 1)[1].strip()
+    access_token = token or bearer
+    if not access_token:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    auth = await auth_from_token(access_token, db)
+    conversation = await _get_tenant_conversation(db, auth.tenant_id, conversation_id)
+
+    async def event_generator():
+        queue = await stream_hub.subscribe(conversation.id)
+        try:
+            yield _sse("ready", {"conversation_id": str(conversation.id)})
+            while True:
+                if await request.is_disconnected():
+                    break
+                try:
+                    event = await asyncio.wait_for(queue.get(), timeout=25.0)
+                except asyncio.TimeoutError:
+                    yield ": keepalive\n\n"
+                    continue
+                if event is None:
+                    break
+                event_type = str(event.get("type") or "message")
+                yield _sse(event_type, event)
+        finally:
+            await stream_hub.unsubscribe(conversation.id, queue)
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
 @router.post("/twilio/inbound")
 async def twilio_inbound(
     request: Request,
+    background_tasks: BackgroundTasks,
     db: Annotated[AsyncSession, Depends(get_db)],
     x_twilio_signature: Annotated[str | None, Header(alias="X-Twilio-Signature")] = None,
 ) -> Response:
-    """Twilio inbound webhook for both SMS and WhatsApp."""
+    """Twilio inbound webhook for both SMS and WhatsApp.
+
+    Persist + ack quickly; AI generation runs in a background task so Twilio
+    is not held open for the full OpenAI round-trip.
+    """
     settings = get_settings()
     form = await request.form()
     params: dict[str, Any] = {key: form.get(key) for key in form.keys()}
@@ -450,11 +513,8 @@ async def twilio_inbound(
 
     service = InboundMessageService(db, settings=settings, provider=provider)
     try:
-        await service.process_inbound(
-            tenant_id=tenant.id,
-            inbound=inbound,
-            status_callback_url=status_callback_url,
-        )
+        accepted = await service.accept_inbound(tenant_id=tenant.id, inbound=inbound)
+        await db.commit()
     except Exception:
         logger.exception(
             "Inbound processing failure provider=twilio channel=%s message_sid=%s",
@@ -462,6 +522,15 @@ async def twilio_inbound(
             inbound.message_id,
         )
         return Response(content="<Response></Response>", media_type="application/xml")
+
+    if accepted.get("should_ai_reply"):
+        background_tasks.add_task(
+            _background_ai_reply,
+            tenant_id=tenant.id,
+            conversation_id=UUID(accepted["conversation_id"]),
+            inbound_message_id=UUID(accepted["inbound_message_id"]),
+            status_callback_url=status_callback_url,
+        )
 
     return Response(content="<Response></Response>", media_type="application/xml")
 
@@ -504,6 +573,40 @@ async def twilio_status(
         "message_sid": status_update.message_id,
         "provider_status": status_update.status,
     }
+
+
+async def _background_ai_reply(
+    *,
+    tenant_id: UUID,
+    conversation_id: UUID,
+    inbound_message_id: UUID,
+    status_callback_url: str | None,
+) -> None:
+    settings = get_settings()
+    provider = get_messaging_provider(settings)
+    async with get_session_factory()() as session:
+        try:
+            service = InboundMessageService(session, settings=settings, provider=provider)
+            await service.generate_and_send_reply(
+                tenant_id=tenant_id,
+                conversation_id=conversation_id,
+                inbound_message_id=inbound_message_id,
+                status_callback_url=status_callback_url,
+            )
+            await session.commit()
+        except Exception:
+            await session.rollback()
+            logger.exception(
+                "BACKGROUND_AI_REPLY_FAILED conversation_id=%s inbound_message_id=%s",
+                conversation_id,
+                inbound_message_id,
+            )
+            await stream_hub.publish_error(conversation_id, reason="background_failure")
+
+
+def _sse(event: str, data: dict[str, Any]) -> str:
+    payload = json.dumps(data, default=str)
+    return f"event: {event}\ndata: {payload}\n\n"
 
 
 async def _get_tenant_conversation(

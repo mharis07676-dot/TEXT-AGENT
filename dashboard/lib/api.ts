@@ -154,6 +154,42 @@ export const api = {
     });
   },
 
+  /**
+   * Subscribe to conversation SSE (inbound + AI stream deltas).
+   * Uses query token because EventSource cannot set Authorization headers.
+   */
+  openConversationStream(
+    conversationId: string,
+    handlers: {
+      onEvent?: (event: string, data: Record<string, unknown>) => void;
+      onError?: (error: Event) => void;
+    } = {},
+  ): EventSource {
+    const token = getToken();
+    if (!token) {
+      throw new ApiError(401, "Not authenticated");
+    }
+    const url = `${API_URL}/messaging/conversations/${conversationId}/stream${toQuery({
+      token,
+    })}`;
+    const source = new EventSource(url);
+    const named = ["ready", "inbound", "start", "delta", "done", "error"];
+    for (const name of named) {
+      source.addEventListener(name, (event) => {
+        try {
+          const data = JSON.parse((event as MessageEvent).data) as Record<string, unknown>;
+          handlers.onEvent?.(name, data);
+        } catch {
+          // ignore malformed frames
+        }
+      });
+    }
+    source.onerror = (error) => {
+      handlers.onError?.(error);
+    };
+    return source;
+  },
+
   getContacts(params: { q?: string; page?: number; page_size?: number } = {}) {
     return request<Paginated<Contact>>(
       `/messaging/contacts${toQuery({

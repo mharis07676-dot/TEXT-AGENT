@@ -59,3 +59,5 @@ class TextAgentContext(BaseModel):
     channel: MessagingChannel
     history: list[ConversationHistoryItem] = Field(default_factory=list)
     latest_user_message: str
+    known_facts: dict[str, str] = Field(default_factory=dict)
+    is_new_conversation: bool = False

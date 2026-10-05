@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { EmptyState } from "@/components/EmptyState";
@@ -11,6 +11,9 @@ import { MessageComposer } from "@/components/text-agent/MessageComposer";
 import { MessageList } from "@/components/text-agent/MessageList";
 import { api } from "@/lib/api";
 import type { Conversation, ConversationFilter, Message } from "@/lib/types";
+
+const STREAM_TEMP_ID = "temp-stream";
+const DELTA_FLUSH_MS = 50;
 
 function useDebouncedValue<T>(value: T, delayMs: number): T {
   const [debounced, setDebounced] = useState(value);
@@ -42,6 +45,12 @@ export function InboxWorkspace({ initialConversationId = null }: { initialConver
   const [confirmAction, setConfirmAction] = useState<"close" | "archive" | null>(null);
   const [confirmBusy, setConfirmBusy] = useState(false);
   const [mobileView, setMobileView] = useState<"list" | "chat" | "details">("list");
+  const [aiTyping, setAiTyping] = useState(false);
+
+  const streamBufferRef = useRef("");
+  const flushTimerRef = useRef<number | null>(null);
+  const selectedIdRef = useRef<string | null>(selectedId);
+  selectedIdRef.current = selectedId;
 
   const selected = useMemo(
     () => conversations.find((item) => item.id === selectedId) ?? conversation,
@@ -68,6 +77,7 @@ export function InboxWorkspace({ initialConversationId = null }: { initialConver
   const loadThread = useCallback(async (id: string) => {
     setMessagesLoading(true);
     setSendError(null);
+    setAiTyping(false);
     try {
       const [conv, messageResult] = await Promise.all([
         api.getConversation(id),
@@ -86,6 +96,40 @@ export function InboxWorkspace({ initialConversationId = null }: { initialConver
     }
   }, []);
 
+  const flushStreamBuffer = useCallback(() => {
+    const text = streamBufferRef.current;
+    setMessages((current) => {
+      const existing = current.find((item) => item.id === STREAM_TEMP_ID);
+      if (!existing) {
+        if (!selectedIdRef.current) return current;
+        return [
+          ...current.filter((item) => item.id !== STREAM_TEMP_ID),
+          {
+            id: STREAM_TEMP_ID,
+            conversation_id: selectedIdRef.current,
+            role: "assistant",
+            direction: "outbound",
+            channel: selected?.channel ?? "sms",
+            body: text,
+            streaming: true,
+            created_at: new Date().toISOString(),
+          },
+        ];
+      }
+      return current.map((item) =>
+        item.id === STREAM_TEMP_ID ? { ...item, body: text, streaming: true } : item,
+      );
+    });
+  }, [selected?.channel]);
+
+  const scheduleFlush = useCallback(() => {
+    if (flushTimerRef.current != null) return;
+    flushTimerRef.current = window.setTimeout(() => {
+      flushTimerRef.current = null;
+      flushStreamBuffer();
+    }, DELTA_FLUSH_MS);
+  }, [flushStreamBuffer]);
+
   useEffect(() => {
     void loadConversations();
   }, [loadConversations]);
@@ -94,14 +138,121 @@ export function InboxWorkspace({ initialConversationId = null }: { initialConver
     if (!selectedId) {
       setConversation(null);
       setMessages([]);
+      setAiTyping(false);
       return;
     }
     void loadThread(selectedId);
   }, [selectedId, loadThread]);
 
-  // Safe polling while a conversation is open.
+  // SSE for live inbound + AI streaming; light polling as a safety net.
   useEffect(() => {
     if (!selectedId) return;
+
+    let source: EventSource | null = null;
+    try {
+      source = api.openConversationStream(selectedId, {
+        onEvent: (event, data) => {
+          if (selectedIdRef.current !== selectedId) return;
+
+          if (event === "inbound") {
+            const message = data.message as Message | undefined;
+            if (!message?.id) return;
+            setMessages((current) => {
+              if (current.some((item) => item.id === message.id)) return current;
+              return [...current.filter((item) => item.id !== STREAM_TEMP_ID || item.streaming), message];
+            });
+            void loadConversations();
+            return;
+          }
+
+          if (event === "start") {
+            streamBufferRef.current = "";
+            setAiTyping(true);
+            setMessages((current) => [
+              ...current.filter((item) => item.id !== STREAM_TEMP_ID),
+              {
+                id: STREAM_TEMP_ID,
+                conversation_id: selectedId,
+                role: "assistant",
+                direction: "outbound",
+                channel: selected?.channel ?? "sms",
+                body: "",
+                streaming: true,
+                created_at: new Date().toISOString(),
+              },
+            ]);
+            return;
+          }
+
+          if (event === "delta") {
+            const text = typeof data.text === "string" ? data.text : "";
+            if (!text) return;
+            streamBufferRef.current += text;
+            scheduleFlush();
+            return;
+          }
+
+          if (event === "done") {
+            if (flushTimerRef.current != null) {
+              window.clearTimeout(flushTimerRef.current);
+              flushTimerRef.current = null;
+            }
+            const messageId = typeof data.message_id === "string" ? data.message_id : null;
+            const body =
+              typeof data.body === "string" ? data.body : streamBufferRef.current;
+            streamBufferRef.current = "";
+            setAiTyping(false);
+            setMessages((current) => {
+              const withoutTemp = current.filter((item) => item.id !== STREAM_TEMP_ID);
+              if (!messageId) return withoutTemp;
+              if (withoutTemp.some((item) => item.id === messageId)) return withoutTemp;
+              return [
+                ...withoutTemp,
+                {
+                  id: messageId,
+                  conversation_id: selectedId,
+                  role: "assistant",
+                  direction: "outbound",
+                  channel: selected?.channel ?? "sms",
+                  body,
+                  provider_status: "queued",
+                  created_at: new Date().toISOString(),
+                },
+              ];
+            });
+            void loadThread(selectedId);
+            void loadConversations();
+            return;
+          }
+
+          if (event === "error") {
+            if (flushTimerRef.current != null) {
+              window.clearTimeout(flushTimerRef.current);
+              flushTimerRef.current = null;
+            }
+            streamBufferRef.current = "";
+            setAiTyping(false);
+            setMessages((current) =>
+              current.map((item) =>
+                item.id === STREAM_TEMP_ID
+                  ? {
+                      ...item,
+                      body: item.body || "AI response failed.",
+                      streaming: false,
+                      failed: true,
+                      provider_status: "failed",
+                    }
+                  : item,
+              ),
+            );
+            setToast("AI response failed.");
+          }
+        },
+      });
+    } catch {
+      // Fall back to polling only.
+    }
+
     const timer = window.setInterval(() => {
       void (async () => {
         try {
@@ -113,19 +264,31 @@ export function InboxWorkspace({ initialConversationId = null }: { initialConver
           setConversations(convList.items);
           setConversation(conv);
           setMessages((current) => {
+            const streaming = current.find((item) => item.id === STREAM_TEMP_ID && item.streaming);
             const optimistic = current.filter((item) => item.optimistic);
             const serverIds = new Set(messageResult.items.map((item) => item.id));
             const pending = optimistic.filter((item) => !serverIds.has(item.id));
-            return [...messageResult.items, ...pending];
+            const merged = [...messageResult.items, ...pending];
+            return streaming ? [...merged.filter((item) => item.id !== STREAM_TEMP_ID), streaming] : merged;
           });
           setHasMore(messageResult.has_more);
         } catch {
           // Keep the current view on poll failures.
         }
       })();
-    }, 8000);
-    return () => window.clearInterval(timer);
-  }, [selectedId, debouncedSearch, filter]);
+    }, 12000);
+
+    return () => {
+      source?.close();
+      window.clearInterval(timer);
+      if (flushTimerRef.current != null) {
+        window.clearTimeout(flushTimerRef.current);
+        flushTimerRef.current = null;
+      }
+      streamBufferRef.current = "";
+      setAiTyping(false);
+    };
+  }, [selectedId, debouncedSearch, filter, loadConversations, loadThread, scheduleFlush, selected?.channel]);
 
   useEffect(() => {
     if (!toast) return;
@@ -293,6 +456,7 @@ export function InboxWorkspace({ initialConversationId = null }: { initialConver
                   hasMore={hasMore}
                   loadingOlder={loadingOlder}
                   onLoadOlder={() => void loadOlder()}
+                  aiTyping={aiTyping}
                 />
               </div>
               <MessageComposer

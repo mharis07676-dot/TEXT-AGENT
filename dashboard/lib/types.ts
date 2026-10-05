@@ -66,6 +66,7 @@ export interface Message {
   created_at?: string | null;
   optimistic?: boolean;
   failed?: boolean;
+  streaming?: boolean;
 }
 
 export interface Contact {

@@ -7,6 +7,7 @@ export function MessageBubble({ message }: { message: Message }) {
   const isHuman = message.role === "human";
   const status = deliveryLabel(message.failed ? "failed" : message.provider_status);
   const failed = Boolean(message.failed) || status === "Failed";
+  const streaming = Boolean(message.streaming);
 
   return (
     <div className={`flex ${isCustomer ? "justify-start" : "justify-end"}`}>
@@ -32,15 +33,23 @@ export function MessageBubble({ message }: { message: Message }) {
           {message.optimistic ? (
             <span className={`text-[10px] ${isCustomer ? "text-moss/50" : "text-white/70"}`}>Sending…</span>
           ) : null}
+          {streaming ? (
+            <span className={`text-[10px] ${isCustomer ? "text-moss/50" : "text-white/70"}`} role="status">
+              AI is typing…
+            </span>
+          ) : null}
         </div>
-        <p className="whitespace-pre-wrap text-sm leading-relaxed">{message.body}</p>
+        <p className="whitespace-pre-wrap text-sm leading-relaxed">
+          {message.body || (streaming ? "…" : "")}
+          {streaming ? <span className="ml-0.5 inline-block animate-pulse">▍</span> : null}
+        </p>
         <div
           className={`mt-1.5 flex items-center gap-2 text-[11px] ${
             isCustomer ? "text-moss/50" : "text-white/70"
           }`}
         >
           <span>{formatTime(message.created_at)}</span>
-          {!isCustomer && status ? <span>{status}</span> : null}
+          {!isCustomer && !streaming && status ? <span>{status}</span> : null}
           {failed ? (
             <span className="font-semibold text-amber-200" role="status">
               Failed to send

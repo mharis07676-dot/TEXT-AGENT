@@ -148,6 +148,24 @@ describe("MessageBubble", () => {
     rerender(<MessageBubble message={messages[2]} />);
     expect(screen.getByText("You")).toBeInTheDocument();
   });
+
+  it("shows AI is typing while streaming into one bubble", () => {
+    render(
+      <MessageBubble
+        message={{
+          id: "temp-stream",
+          conversation_id: "c1",
+          role: "assistant",
+          direction: "outbound",
+          channel: "whatsapp",
+          body: "Sure —",
+          streaming: true,
+        }}
+      />,
+    );
+    expect(screen.getByText("AI is typing…")).toBeInTheDocument();
+    expect(screen.getByText(/Sure —/)).toBeInTheDocument();
+  });
 });
 
 describe("MessageComposer", () => {
